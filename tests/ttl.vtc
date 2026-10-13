@@ -1,0 +1,36 @@
+varnishtest "gitcache: refs live seconds with no grace, packs live a week"
+
+server s1 {
+	rxreq
+	txresp -body "PACK"
+	rxreq
+	txresp -body "REFS"
+} -start
+
+varnish v1 -vcl+backend {
+	import gitcache from "${vmod}";
+	sub vcl_init {
+		new git = gitcache.cache(scope = "t", preflight = false);
+	}
+	sub vcl_recv { if (git.recv()) { return (hash); } }
+	sub vcl_hash             { if (git.hash()) { return (lookup); } }
+	sub vcl_backend_fetch    { git.backend_fetch(); }
+	sub vcl_backend_response { if (git.backend_response()) { return (deliver); } }
+	sub vcl_deliver {
+		set resp.http.X-TTL = obj.ttl;
+		set resp.http.X-Grace = obj.grace;
+		if (git.deliver()) { return (restart); }
+	}
+} -start
+
+client c1 {
+	txreq -req POST -url "/o/r.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -body "0012command=fetch\n00010032want aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n0009done\n0000"
+	rxresp
+	expect resp.body == "PACK"
+	expect resp.http.X-TTL ~ "^60[0-9]{4}[.]"
+	txreq -url "/o/r.git/info/refs?service=git-upload-pack" -hdr "Git-Protocol: version=2"
+	rxresp
+	expect resp.body == "REFS"
+	expect resp.http.X-TTL ~ "^[0-5][.]"
+	expect resp.http.X-Grace == "0.000"
+} -run

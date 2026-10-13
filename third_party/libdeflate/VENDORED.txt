@@ -1,0 +1,7 @@
+libdeflate 1.26 (https://github.com/ebiggers/libdeflate, tag v1.26), MIT licence, see COPYING.
+Source archive sha256: bba03fffc5538576213675ce6968fcff6ce2e67d82e4d5febea2d05f9f13cf85
+
+Only the gzip/DEFLATE decompression path is included. Not vendored: the compressor, the zlib
+format wrapper and Adler-32 (lib/deflate_compress.c, gzip_compress.c, zlib_*.c, adler32.c), and
+the command line programs. No file was modified. It is compiled with -fvisibility=hidden so its
+symbols are never exported from the module.

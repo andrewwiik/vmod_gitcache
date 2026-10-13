@@ -1,0 +1,39 @@
+varnishtest "gitcache: workspace exhaustion is reported by the vmod and fails the request, never yielding a wrong key"
+
+server s1 {
+	rxreq
+	txresp
+} -start
+
+varnish v1 -vcl+backend {
+	import gitcache from "${vmod}";
+	import vtc;
+	sub vcl_recv {
+		if (req.url == "/ok") {
+			set req.http.X-Key = gitcache.cache_key();
+			return (synth(200, "key=" + req.http.X-Key));
+		}
+		vtc.workspace_alloc(client, -80);
+		set req.http.X-Never = gitcache.cache_key();
+		return (synth(200, "should-not-get-here"));
+	}
+}  -start
+
+logexpect l1 -v v1 -g request {
+	expect * * VCL_Error "gitcache: out of workspace"
+	expect * * End
+} -start
+
+client c1 {
+	txreq -url "/ok" -hdr "Git-Protocol: version=2"
+	rxresp
+	expect resp.status == 200
+	expect resp.reason == "key="
+} -run
+
+client c2 {
+	txreq -url "/x/y.git/info/refs?service=git-upload-pack" -hdr "Git-Protocol: version=2"
+	delay 0.5
+} -run
+
+logexpect l1 -wait

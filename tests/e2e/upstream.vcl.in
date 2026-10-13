@@ -1,0 +1,20 @@
+# Template: @IMPORTS@, @BACKEND_DEF@, @BACKEND_SELECT@, @CACHE_ARGS@ and @UPSTREAM@ are filled in by the test script.
+vcl 4.0;
+import gitcache;
+@IMPORTS@
+
+@BACKEND_DEF@
+
+sub vcl_init {
+	new git = gitcache.cache(scope = "@UPSTREAM@"@CACHE_ARGS@);
+}
+
+sub vcl_recv             { if (git.recv()) { return (hash); } }
+sub vcl_hash             { if (git.hash()) { return (lookup); } }
+sub vcl_backend_fetch    {
+	@BACKEND_SELECT@
+	set bereq.http.Host = "@UPSTREAM@";
+	git.backend_fetch();
+}
+sub vcl_backend_response { if (git.backend_response()) { return (deliver); } }
+sub vcl_deliver          { if (git.deliver()) { return (restart); } }

@@ -1,0 +1,42 @@
+varnishtest "gitcache: a pack that takes longer than Varnish's default timeouts still completes"
+
+server s1 {
+	rxreq
+	txresp -hdr "Transfer-Encoding: chunked"
+	chunkedlen 100
+	delay 1
+	chunkedlen 100
+	delay 1
+	chunkedlen 100
+	delay 1.5
+	chunkedlen 100
+	chunkedlen 0
+
+	rxreq
+	delay 3
+	txresp -body "LATE"
+} -start
+
+varnish v1 -arg "-p send_timeout=2" -arg "-p first_byte_timeout=2" -vcl+backend {
+	import gitcache from "${vmod}";
+	sub vcl_init {
+		new git = gitcache.cache(scope = "t", preflight = false);
+	}
+	sub vcl_recv { if (git.recv()) { return (hash); } }
+	sub vcl_hash             { if (git.hash()) { return (lookup); } }
+	sub vcl_backend_fetch    { git.backend_fetch(); }
+	sub vcl_backend_response { if (git.backend_response()) { return (deliver); } }
+	sub vcl_deliver          { if (git.deliver()) { return (restart); } }
+} -start
+
+client c1 {
+	txreq -req POST -url "/o/r.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -body "0012command=fetch\n00010032want aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n0009done\n0000"
+	rxresp
+	expect resp.status == 200
+	expect resp.bodylen == 400
+
+	txreq -req POST -url "/o/r.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -body "0012command=fetch\n00010032want bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n0009done\n0000"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "LATE"
+} -run

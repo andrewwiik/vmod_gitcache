@@ -1,0 +1,22 @@
+FROM docker.io/library/debian:trixie
+ARG VARNISH_VERSION=9.0.4
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential autoconf automake libtool pkg-config python3 python3-docutils python3-sphinx \
+      libedit-dev libncurses-dev libpcre2-dev libssl-dev zlib1g-dev curl ca-certificates git git-lfs clang llvm libclang-rt-19-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; cd /tmp; \
+    curl -fsSLO https://github.com/varnish/varnish/releases/download/varnish-${VARNISH_VERSION}/varnish-${VARNISH_VERSION}.tar.gz; \
+    (curl -fsSLO https://github.com/varnish/varnish/releases/download/varnish-${VARNISH_VERSION}/varnish-${VARNISH_VERSION}.tar.gz.sha256 \
+       && sha256sum -c varnish-${VARNISH_VERSION}.tar.gz.sha256 && echo "CHECKSUM VERIFIED against published .sha256") \
+       || echo "NO PUBLISHED CHECKSUM FOUND; computed sha256 follows"; \
+    sha256sum varnish-${VARNISH_VERSION}.tar.gz; \
+    tar xzf varnish-${VARNISH_VERSION}.tar.gz; cd varnish-${VARNISH_VERSION}; \
+    ./configure --prefix=/usr/local >/tmp/configure.log 2>&1 || (tail -30 /tmp/configure.log; exit 1); \
+    make -j8 >/tmp/make.log 2>&1 || (tail -30 /tmp/make.log; exit 1); \
+    make install >/dev/null; ldconfig; \
+    ls /usr/local/bin /usr/local/sbin | tr '\n' ' '; echo; \
+    ls /usr/local/include; \
+    pkg-config --modversion varnishapi || true
+RUN apt-get update && apt-get install -y --no-install-recommends stunnel4 && rm -rf /var/lib/apt/lists/*
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig LD_LIBRARY_PATH=/usr/local/lib
+WORKDIR /work

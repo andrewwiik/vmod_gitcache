@@ -1,0 +1,268 @@
+varnishtest "gitcache: gzip, instance scope, credentials, protocol parameters, probes, dumb, LFS, limits"
+
+server s1 {
+	loop 80 {
+		rxreq
+		txresp
+	}
+} -start
+
+varnish v1 -vcl+backend {
+	import gitcache from "${vmod}";
+	sub vcl_recv {
+		if (gitcache.kind() == "") { return (pass); }
+		if (req.http.X-Mode == "scope") {
+			set req.http.X-Key = gitcache.cache_key(scope = req.http.X-Up);
+		} else if (req.http.X-Mode == "share") {
+			set req.http.X-Key = gitcache.cache_key(share_credentials = true);
+		} else if (req.http.X-Mode == "small") {
+			set req.http.X-Key = gitcache.cache_key(limit = 100B);
+		} else if (req.http.X-Mode == "lfs") {
+			set req.http.X-Key = gitcache.cache_key(lfs_batch = true);
+		} else {
+			set req.http.X-Key = gitcache.cache_key();
+		}
+		if (req.http.X-Key == "") { return (pass); }
+		return (hash);
+	}
+	sub vcl_hash {
+		hash_data(req.http.X-Key);
+		return (lookup);
+	}
+	sub vcl_backend_fetch {
+		if (bereq.http.Content-Length) { set bereq.method = "POST"; }
+	}
+	sub vcl_backend_response {
+		set beresp.ttl = 60s;
+		return (deliver);
+	}
+	sub vcl_deliver {
+		set resp.http.X-Hits = obj.hits;
+		set resp.http.X-Key = req.http.X-Key;
+		set resp.http.X-Cred = gitcache.credential();
+	}
+} -start
+
+client c1 {
+	txreq -req POST -url "/g/one.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -body "0012command=fetch\n0015agent=git/2.43.0\n0017object-format=sha1\n0001000ewant 1111\n000ewant 2222\n0009done\n0000"
+	rxresp
+	expect resp.http.X-Hits == "0"
+	txreq -req POST -url "/g/one.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -hdr "Content-Encoding: gzip" -gzipbody "0012command=fetch\n001bagent=git/2.50.1-Apple\n0017object-format=sha1\n0001000ewant 2222\n000ewant 1111\n0009done\n0000"
+	rxresp
+	expect resp.http.X-Hits == "1"
+	txreq -req POST -url "/g/one.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -body "0012command=fetch\n0015agent=git/2.43.0\n0017object-format=sha1\n0001000ewant 3333\n0009done\n0000"
+	rxresp
+	expect resp.http.X-Hits == "0"
+} -run
+
+client c2 {
+	txreq -req POST -url "/s/one.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -hdr "X-Mode: scope" -hdr "X-Up: ghes-a" -body "0012command=fetch\n0015agent=git/2.43.0\n0017object-format=sha1\n0001000ewant 1111\n0009done\n0000"
+	rxresp
+	expect resp.http.X-Hits == "0"
+	expect resp.http.X-Key ~ "^ghes-a/s/one[.]git/"
+	txreq -req POST -url "/s/one.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -hdr "X-Mode: scope" -hdr "X-Up: ghes-b" -body "0012command=fetch\n0015agent=git/2.43.0\n0017object-format=sha1\n0001000ewant 1111\n0009done\n0000"
+	rxresp
+	expect resp.http.X-Hits == "0"
+	expect resp.http.X-Key ~ "^ghes-b/s/one[.]git/"
+	txreq -req POST -url "/s/one.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -hdr "X-Mode: scope" -hdr "X-Up: ghes-a" -body "0012command=fetch\n0015agent=git/2.43.0\n0017object-format=sha1\n0001000ewant 1111\n0009done\n0000"
+	rxresp
+	expect resp.http.X-Hits == "1"
+} -run
+
+client c3 {
+	txreq -req POST -url "/c/one.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -body "0012command=fetch\n0015agent=git/2.43.0\n0017object-format=sha1\n0001000ewant 1111\n0009done\n0000"
+	rxresp
+	expect resp.http.X-Hits == "0"
+	expect resp.http.X-Key !~ "cred="
+	expect resp.http.X-Cred == ""
+	txreq -req POST -url "/c/one.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -hdr "Authorization: Basic QUFBOnQtYWxpY2U=" -body "0012command=fetch\n0015agent=git/2.43.0\n0017object-format=sha1\n0001000ewant 1111\n0009done\n0000"
+	rxresp
+	expect resp.http.X-Hits == "0"
+	expect resp.http.X-Key ~ "#cred=[0-9a-f]+$"
+	expect resp.http.X-Cred ~ "^[0-9a-f]+$"
+	expect resp.http.X-Cred !~ "QUFB"
+	txreq -req POST -url "/c/one.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -hdr "Authorization: Basic QUFBOnQtYWxpY2U=" -body "0012command=fetch\n0015agent=git/2.43.0\n0017object-format=sha1\n0001000ewant 1111\n0009done\n0000"
+	rxresp
+	expect resp.http.X-Hits == "1"
+	txreq -req POST -url "/c/one.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -hdr "Authorization: Basic Ym9iOnQtYm9i" -body "0012command=fetch\n0015agent=git/2.43.0\n0017object-format=sha1\n0001000ewant 1111\n0009done\n0000"
+	rxresp
+	expect resp.http.X-Hits == "0"
+	txreq -req POST -url "/c/two.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -hdr "X-Mode: share" -hdr "Authorization: Basic QUFBOnQtYWxpY2U=" -body "0012command=fetch\n0015agent=git/2.43.0\n0017object-format=sha1\n0001000ewant 1111\n0009done\n0000"
+	rxresp
+	expect resp.http.X-Hits == "0"
+	expect resp.http.X-Key !~ "cred="
+	txreq -req POST -url "/c/two.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -hdr "X-Mode: share" -hdr "Authorization: Basic Ym9iOnQtYm9i" -body "0012command=fetch\n0015agent=git/2.43.0\n0017object-format=sha1\n0001000ewant 1111\n0009done\n0000"
+	rxresp
+	expect resp.http.X-Hits == "1"
+} -run
+
+client c4 {
+	txreq -req GET -url "/p/one.git/info/refs?service=git-upload-pack" -hdr "Git-Protocol: version=2" 
+	rxresp
+	expect resp.http.X-Hits == "0"
+	expect resp.http.X-Key ~ "/v2$"
+	txreq -req GET -url "/p/one.git/info/refs?service=git-upload-pack" 
+	rxresp
+	expect resp.http.X-Hits == "0"
+	expect resp.http.X-Key ~ "/v0$"
+	txreq -req GET -url "/p/one.git/info/refs?service=git-upload-pack" -hdr "Git-Protocol: version=1" 
+	rxresp
+	expect resp.http.X-Hits == "0"
+	expect resp.http.X-Key ~ "/v1$"
+	txreq -req GET -url "/p/one.git/info/refs?service=git-upload-pack" -hdr "Git-Protocol: version=2" 
+	rxresp
+	expect resp.http.X-Hits == "1"
+	txreq -req GET -url "/p/one.git/info/refs?service=git-upload-pack" -hdr "Git-Protocol: version=2:object-format=sha256" 
+	rxresp
+	expect resp.http.X-Hits == "0"
+	expect resp.http.X-Key ~ "/v2[+]object-format=sha256$"
+	txreq -req GET -url "/p/one.git/info/refs?service=git-upload-pack" -hdr "Git-Protocol: object-format=sha256:version=2" 
+	rxresp
+	expect resp.http.X-Hits == "1"
+	txreq -req GET -url "/p/one.git/info/refs?service=git-upload-pack&x=1" -hdr "Git-Protocol: version=2" 
+	rxresp
+	expect resp.http.X-Hits == "2"
+	txreq -req GET -url "/p/one.git/info/refs?service=git-receive-pack" -hdr "Git-Protocol: version=2"
+	rxresp
+	expect resp.http.X-Key == ""
+	txreq -req GET -url "/p/one.git/info/refs?service=git-upload-pack" -hdr "Git-Protocol: version=2:version=2"
+	rxresp
+	expect resp.http.X-Key ~ "/v2$"
+	txreq -req GET -url "/p/one.git/info/refs?service=git-upload-pack" -hdr "Git-Protocol: version=1:version=2"
+	rxresp
+	expect resp.http.X-Key == ""
+	txreq -req GET -url "/p/one.git/info/refs?service=git-upload-pack" -hdr "Git-Protocol: version=0: version=2"
+	rxresp
+	expect resp.http.X-Key == ""
+	txreq -req GET -url "/p/one.git/info/refs?service=git-upload-pack" -hdr "Git-Protocol: version=3"
+	rxresp
+	expect resp.http.X-Key == ""
+	txreq -req GET -url "/p/one.git/info/refs?service=git-upload-pack" -hdr "Git-Protocol: version=0" -hdr "Git-Protocol: version=2"
+	rxresp
+	expect resp.http.X-Key == ""
+	txreq -req GET -url "/p/one.git/info/refs?service=git-upload-pack" -hdr "Git-Protocol: a:b:c:d:e:f:g:h:i:j:k:l:m:n:o:p"
+	rxresp
+	expect resp.http.X-Key ~ "/v0[+]a[+]b[+]c[+]d[+]e[+]f[+]g[+]h[+]i[+]j[+]k[+]l[+]m[+]n[+]o[+]p$"
+	txreq -req GET -url "/p/one.git/info/refs?service=git-upload-pack" -hdr "Git-Protocol: a:b:c:d:e:f:g:h:i:j:k:l:m:n:o:p:q=1"
+	rxresp
+	expect resp.http.X-Key == ""
+} -run
+
+client c5 {
+	txreq -req POST -url "/l/one.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -hdr "X-Mode: small" -body "0014command=ls-refs\n00010058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx1\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx2\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx3\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx4\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx5\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx6\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx7\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx8\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx9\n0059ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx10\n0059ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx11\n0000"
+	rxresp
+	expect resp.http.X-Key == ""
+	txreq -req POST -url "/l/one.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -hdr "X-Mode: small" -hdr "Content-Encoding: gzip" -gzipbody "0014command=ls-refs\n00010058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx1\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx2\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx3\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx4\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx5\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx6\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx7\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx8\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx9\n0059ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx10\n0059ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx11\n0000"
+	rxresp
+	expect resp.http.X-Key == ""
+	txreq -req POST -url "/l/one.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -hdr "Content-Encoding: gzip" -gzipbody "0014command=ls-refs\n00010058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx1\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx2\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx3\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx4\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx5\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx6\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx7\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx8\n0058ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx9\n0059ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx10\n0059ref-prefix refs/heads/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx11\n0000"
+	rxresp
+	expect resp.http.X-Key ~ "^/l/one[.]git/git-upload-pack/v2/"
+	txreq -req POST -url "/l/one.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -hdr "Content-Encoding: br" -body "0000"
+	rxresp
+	expect resp.http.X-Key == ""
+	txreq -req POST -url "/l/one.git/git-upload-pack" -hdr "Git-Protocol: version=2" -body "0012command=fetch\n0015agent=git/2.43.0\n0017object-format=sha1\n0001000ewant 1111\n0009done\n0000"
+	rxresp
+	expect resp.http.X-Key == ""
+	txreq -req POST -url "/l/one.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: text/plain" -body "0012command=fetch\n0015agent=git/2.43.0\n0017object-format=sha1\n0001000ewant 1111\n0009done\n0000"
+	rxresp
+	expect resp.http.X-Key == ""
+	txreq -req POST -url "/l/one.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -body "0000"
+	rxresp
+	expect resp.http.X-Key == ""
+	txreq -req POST -url "/l/one.git/git-upload-pack" -hdr "Content-Type: application/x-git-upload-pack-request" -body "0000"
+	rxresp
+	expect resp.http.X-Key == ""
+	txreq -req POST -url "/l/one.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -body "zzzz"
+	rxresp
+	expect resp.http.X-Key == ""
+} -run
+
+client c6 {
+	txreq -req GET -url "/d/one.git/objects/pack/pack-0123456789abcdef0123456789abcdef01234567.pack" 
+	rxresp
+	expect resp.http.X-Hits == "0"
+	txreq -req GET -url "/d/one.git/objects/pack/pack-0123456789abcdef0123456789abcdef01234567.pack" 
+	rxresp
+	expect resp.http.X-Hits == "1"
+	txreq -req GET -url "/d/one.git/objects/pack/pack-0123456789abcdef0123456789abcdef01234567.pack" -hdr "Authorization: Basic QUFBOnQtYWxpY2U=" 
+	rxresp
+	expect resp.http.X-Hits == "0"
+	txreq -req GET -url "/d/one.git/objects/ab/cdef0123456789abcdef0123456789abcdef01" 
+	rxresp
+	expect resp.http.X-Hits == "0"
+	expect resp.http.X-Key == "/d/one.git/objects/ab/cdef0123456789abcdef0123456789abcdef01"
+	txreq -req GET -url "/d/one.git/info/refs" 
+	rxresp
+	expect resp.http.X-Hits == "0"
+	expect resp.http.X-Key == "/d/one.git/info/refs"
+	txreq -req GET -url "/d/one.git/HEAD" 
+	rxresp
+	expect resp.http.X-Key == "/d/one.git/HEAD"
+} -run
+
+client c7 {
+	txreq -req POST -url "/f/one.git/info/lfs/objects/batch" -hdr "Content-Type: application/vnd.git-lfs+json" -body "{\"operation\": \"download\", \"objects\": [{\"oid\": \"aa\", \"size\": 1}]}"
+	rxresp
+	expect resp.http.X-Key == ""
+	txreq -req POST -url "/f/one.git/info/lfs/objects/batch" -hdr "X-Mode: lfs" -body "{\"operation\": \"download\", \"objects\": [{\"oid\": \"aa\", \"size\": 1}]}"
+	rxresp
+	expect resp.http.X-Hits == "0"
+	expect resp.http.X-Key ~ "^/f/one[.]git/info/lfs/objects/batch/[0-9a-f]+$"
+	txreq -req POST -url "/f/one.git/info/lfs/objects/batch" -hdr "X-Mode: lfs" -body "{\"operation\": \"download\", \"objects\": [{\"oid\": \"aa\", \"size\": 1}]}"
+	rxresp
+	expect resp.http.X-Hits == "1"
+	txreq -req POST -url "/f/one.git/info/lfs/objects/batch" -hdr "X-Mode: lfs" -body "{\"operation\": \"download\", \"objects\": [{\"oid\": \"aa\", \"size\": 1}, {\"oid\": \"bb\", \"size\": 2}], \"transfers\": [\"lfs-standalone-file\", \"basic\", \"ssh\"]}"
+	rxresp
+	expect resp.http.X-Hits == "0"
+	txreq -req POST -url "/f/one.git/info/lfs/objects/batch" -hdr "X-Mode: lfs" -body "{\"operation\": \"download\", \"objects\": [{\"oid\": \"bb\", \"size\": 2}, {\"oid\": \"aa\", \"size\": 1}], \"transfers\": [\"ssh\", \"lfs-standalone-file\", \"basic\"]}"
+	rxresp
+	expect resp.http.X-Hits == "1"
+	txreq -req POST -url "/f/one.git/info/lfs/objects/batch" -hdr "X-Mode: lfs" -body "{\"operation\": \"upload\", \"objects\": [{\"oid\": \"aa\", \"size\": 1}]}"
+	rxresp
+	expect resp.http.X-Key == ""
+	txreq -req POST -url "/f/one.git/info/lfs/locks/verify" -hdr "X-Mode: lfs" -body "{}"
+	rxresp
+	expect resp.http.X-Key == ""
+	txreq -req GET -url "/f/one.git/info/lfs/objects/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" 
+	rxresp
+	expect resp.http.X-Hits == "0"
+	txreq -req GET -url "/f/one.git/info/lfs/objects/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" 
+	rxresp
+	expect resp.http.X-Hits == "1"
+	txreq -req PUT -url "/f/one.git/info/lfs/objects/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" -body "x"
+	rxresp
+	expect resp.http.X-Key == ""
+} -run
+
+client c8 {
+	txreq -req GET -url "/repository/lfs-hosted/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" 
+	rxresp
+	expect resp.http.X-Hits == "0"
+	expect resp.http.X-Key == "/repository/lfs-hosted.git/lfs-href/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	txreq -req GET -url "/repository/lfs-hosted/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" 
+	rxresp
+	expect resp.http.X-Hits == "1"
+	txreq -req GET -url "/repository/lfs-hosted/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" -hdr "Authorization: Basic QUFBOnQtYWxpY2U=" 
+	rxresp
+	expect resp.http.X-Hits == "0"
+	txreq -req GET -url "/repository/lfs-hosted/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef?sig=aaa" 
+	rxresp
+	expect resp.http.X-Hits == "0"
+	expect resp.http.X-Key ~ "[?]q=[0-9a-f]+$"
+	txreq -req GET -url "/repository/lfs-hosted/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef?sig=aaa" 
+	rxresp
+	expect resp.http.X-Hits == "1"
+	txreq -req GET -url "/repository/lfs-hosted/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef?sig=bbb" 
+	rxresp
+	expect resp.http.X-Hits == "0"
+	txreq -req POST -url "/repository/lfs-hosted/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/verify" -body "{}"
+	rxresp
+	expect resp.http.X-Key == ""
+	txreq -req PUT -url "/repository/lfs-hosted/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" -body "x"
+	rxresp
+	expect resp.http.X-Key == ""
+	txreq -req GET -url "/repository/lfs-hosted/not-an-oid" 
+	rxresp
+	expect resp.http.X-Key == ""
+} -run

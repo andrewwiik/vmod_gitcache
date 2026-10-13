@@ -1,0 +1,7 @@
+0012command=fetch
+00010032want aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+0035shallow bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+000ddeepen 1
+0015filter blob:none
+0009done
+0000

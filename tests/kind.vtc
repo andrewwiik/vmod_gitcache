@@ -1,0 +1,137 @@
+varnishtest "gitcache: request classification, repo extraction, protocol"
+
+server s1 {
+	loop 40 {
+		rxreq
+		txresp
+	}
+} -start
+
+varnish v1 -vcl+backend {
+	import gitcache from "${vmod}";
+	sub vcl_recv {
+		set req.http.X-Kind = gitcache.kind();
+		set req.http.X-Repo = gitcache.repo();
+		set req.http.X-Proto = gitcache.protocol();
+		return (pass);
+	}
+	sub vcl_deliver {
+		set resp.http.X-Kind = req.http.X-Kind;
+		set resp.http.X-Repo = req.http.X-Repo;
+		set resp.http.X-Proto = req.http.X-Proto;
+	}
+} -start
+
+client c1 {
+	txreq -url "/Torvalds/Linux.git/info/refs?service=git-upload-pack"
+	rxresp
+	expect resp.http.X-Kind == "info-refs"
+	expect resp.http.X-Repo == "torvalds/linux"
+	expect resp.http.X-Proto == "0"
+
+	txreq -url "//o/r/info/refs?foo=1&service=git-upload-pack"
+	rxresp
+	expect resp.http.X-Kind == "info-refs"
+	expect resp.http.X-Repo == "o/r"
+
+	txreq -url "/o/r.git/info/refs?service=git-receive-pack"
+	rxresp
+	expect resp.http.X-Kind == "info-refs-push"
+
+	txreq -url "/o/r.git/info/refs"
+	rxresp
+	expect resp.http.X-Kind == "dumb-refs"
+
+	txreq -req POST -url "/o/r.git/git-receive-pack" -body "0000"
+	rxresp
+	expect resp.http.X-Kind == "receive-pack"
+
+	txreq -req POST -url "/o/r.git/info/lfs/objects/batch" -body "{}"
+	rxresp
+	expect resp.http.X-Kind == "lfs-batch"
+
+	txreq -req POST -url "/o/r.git/git-upload-pack" -body "0000"
+	rxresp
+	expect resp.http.X-Kind == "probe"
+	txreq -req POST -url "/o/r.git/git-upload-pack" -hdr "Git-Protocol: version=2" -body "0000"
+	rxresp
+	expect resp.http.X-Kind == "probe"
+
+	txreq -req POST -url "/o/r.git/git-upload-pack" -body "000ewant 1111\n0000"
+	rxresp
+	expect resp.http.X-Kind == "upload-pack"
+	expect resp.http.X-Proto == "0"
+
+	txreq -req POST -url "/o/r.git/git-upload-pack" -hdr "Git-Protocol: object-format=sha256:version=2" -body "0012command=fetch\n0001000ewant 1111\n0000"
+	rxresp
+	expect resp.http.X-Kind == "fetch"
+	expect resp.http.X-Proto == "2"
+
+	txreq -req POST -url "/o/r.git/git-upload-pack" -hdr "Git-Protocol: version=2" -body "0018command=object-info\n00010009size\n0000"
+	rxresp
+	expect resp.http.X-Kind == "object-info"
+
+	txreq -req POST -url "/o/r.git/git-upload-pack" -hdr "Git-Protocol: version=2" -body "0017command=bundle-uri\n00010000"
+	rxresp
+	expect resp.http.X-Kind == "bundle-uri"
+
+	txreq -url "/o/r.git/HEAD"
+	rxresp
+	expect resp.http.X-Kind == "dumb-refs"
+	expect resp.http.X-Repo == "o/r"
+	txreq -url "/o/r.git/objects/info/packs"
+	rxresp
+	expect resp.http.X-Kind == "dumb-refs"
+	txreq -url "/o/r.git/objects/ab/cdef0123456789abcdef0123456789abcdef01"
+	rxresp
+	expect resp.http.X-Kind == "dumb-object"
+	expect resp.http.X-Repo == "o/r"
+	txreq -url "/o/r.git/objects/pack/pack-0123456789abcdef0123456789abcdef01234567.pack"
+	rxresp
+	expect resp.http.X-Kind == "dumb-object"
+	txreq -url "/o/r.git/objects/pack/pack-0123456789abcdef0123456789abcdef01234567.idx"
+	rxresp
+	expect resp.http.X-Kind == "dumb-object"
+	txreq -url "/o/r.git/objects/zz/cdef0123456789abcdef0123456789abcdef01"
+	rxresp
+	expect resp.http.X-Kind == ""
+
+	txreq -req POST -url "/o/r.git/info/lfs/objects/batch" -body "{}"
+	rxresp
+	expect resp.http.X-Kind == "lfs-batch"
+	txreq -url "/o/r.git/info/lfs/objects/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	rxresp
+	expect resp.http.X-Kind == "lfs-object"
+	txreq -req POST -url "/o/r.git/info/lfs/locks/verify" -body "{}"
+	rxresp
+	expect resp.http.X-Kind == "lfs-other"
+	txreq -req PUT -url "/o/r.git/info/lfs/objects/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" -body "x"
+	rxresp
+	expect resp.http.X-Kind == "lfs-other"
+	txreq -url "/repository/lfs-hosted/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	rxresp
+	expect resp.http.X-Kind == "lfs-object"
+	expect resp.http.X-Repo == "repository/lfs-hosted"
+	txreq -req POST -url "/repository/lfs-hosted/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/verify" -body "{}"
+	rxresp
+	expect resp.http.X-Kind == "lfs-other"
+
+	txreq -req POST -url "/o/r.git/git-upload-pack" -hdr "Git-Protocol: version=2" -body "0014command=ls-refs\n0001000apeel\n0000"
+	rxresp
+	expect resp.http.X-Kind == "ls-refs"
+	expect resp.http.X-Proto == "2"
+
+	txreq -req POST -url "/o/r.git/git-upload-pack" -hdr "Git-Protocol: version=2" -body "0012command=fetch\n0001000ewant 1111\n0000"
+	rxresp
+	expect resp.http.X-Kind == "fetch"
+
+	txreq -url "/o/r.git/info/refs?service=git-upload-pack" -hdr "Git-Protocol: version=1:version=2"
+	rxresp
+	expect resp.http.X-Proto == "2"
+
+	# kind() buffers up to 10MB as documented; a body above its old 1MB limit must still reach the origin
+	txreq -req POST -url "/o/r.git/git-upload-pack" -hdr "Git-Protocol: version=2" -bodylen 1100000
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Kind == "fetch"
+} -run

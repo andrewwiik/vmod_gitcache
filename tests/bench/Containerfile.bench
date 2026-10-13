@@ -1,0 +1,35 @@
+FROM docker.io/library/debian:trixie
+ARG AWSLC=v5.11.0
+ARG BLAKE3=1.8.7
+ARG ZLIBNG=2.3.3
+ARG LIBRESSL=4.3.3
+ARG VARNISH=9.1.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake ninja-build golang-go perl git curl ca-certificates pkg-config python3 \
+      libssl-dev libsodium-dev nettle-dev libgcrypt20-dev libgpg-error-dev libmbedtls-dev \
+      libwolfssl-dev libisal-dev libdeflate-dev zlib1g-dev libxxhash-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+RUN git clone -q --depth 1 --branch ${AWSLC} https://github.com/aws/aws-lc.git \
+ && cmake -GNinja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DBUILD_TOOL=OFF -DBUILD_LIBSSL=OFF \
+      -DCMAKE_INSTALL_PREFIX=/opt/awslc -S aws-lc -B aws-lc/b >/dev/null \
+ && ninja -C aws-lc/b install >/dev/null && ls /opt/awslc/lib
+RUN git clone -q --depth 1 https://boringssl.googlesource.com/boringssl \
+ && cmake -GNinja -DCMAKE_BUILD_TYPE=Release -S boringssl -B boringssl/b >/dev/null \
+ && ninja -C boringssl/b crypto >/dev/null \
+ && mkdir -p /opt/boringssl/lib && cp boringssl/b/libcrypto.a /opt/boringssl/lib/ && cp -r boringssl/include /opt/boringssl/
+RUN curl -fsSL https://github.com/BLAKE3-team/BLAKE3/archive/refs/tags/${BLAKE3}.tar.gz | tar xz \
+ && cmake -GNinja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/blake3 -S BLAKE3-${BLAKE3}/c -B b3 >/dev/null \
+ && ninja -C b3 install >/dev/null
+RUN curl -fsSL https://github.com/zlib-ng/zlib-ng/archive/refs/tags/${ZLIBNG}.tar.gz | tar xz \
+ && cmake -GNinja -DCMAKE_BUILD_TYPE=Release -DZLIB_COMPAT=OFF -DBUILD_TESTING=OFF -DWITH_GTEST=OFF \
+      -DCMAKE_INSTALL_PREFIX=/opt/zlibng -S zlib-ng-${ZLIBNG} -B zng >/dev/null \
+ && ninja -C zng install >/dev/null
+RUN curl -fsSL https://cdn.openbsd.org/pub/OpenBSD/LibreSSL/libressl-${LIBRESSL}.tar.gz | tar xz \
+ && cmake -GNinja -DCMAKE_BUILD_TYPE=Release -DLIBRESSL_APPS=OFF -DLIBRESSL_TESTS=OFF \
+      -DCMAKE_INSTALL_PREFIX=/opt/libressl -S libressl-${LIBRESSL} -B lssl >/dev/null \
+ && ninja -C lssl install >/dev/null
+RUN curl -fsSL https://github.com/varnish/varnish/releases/download/varnish-${VARNISH}/varnish-${VARNISH}.tar.gz | tar xz \
+ && mkdir -p /opt/vsha/include && f=$(find varnish-${VARNISH} -name vsha256.c | head -1) && cp $f /opt/vsha/ \
+ && cp varnish-${VARNISH}/include/v*.h /opt/vsha/include/ && : > /opt/vsha/include/config.h && ls /opt/vsha /opt/vsha/include | head -30
+WORKDIR /bench

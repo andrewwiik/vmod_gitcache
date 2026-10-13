@@ -1,0 +1,191 @@
+varnishtest "gitcache: the cache object runs the whole policy from a five-line VCL"
+
+server s1 {
+	rxreq
+	expect req.url == "/plain"
+	txresp -body "plain"
+
+	rxreq
+	expect req.method == "GET"
+	expect req.url == "/o/r.git/info/refs?service=git-upload-pack"
+	expect req.http.Authorization == "Basic QQ=="
+	expect req.bodylen == 0
+	txresp -body "REFS"
+	rxreq
+	expect req.method == "POST"
+	expect req.url == "/o/r.git/git-upload-pack"
+	expect req.bodylen > 0
+	txresp -body "PACK"
+
+	rxreq
+	expect req.method == "GET"
+	expect req.http.Authorization == "Basic Qg=="
+	txresp -body "REFS"
+
+	rxreq
+	expect req.method == "GET"
+	expect req.http.Authorization == "Basic Qw=="
+	txresp -status 401 -body "denied"
+
+	rxreq
+	expect req.method == "POST"
+	expect req.url == "/o/r.git/git-receive-pack"
+	txresp -body "pushed"
+
+	rxreq
+	expect req.method == "GET"
+	expect req.http.Authorization == "Basic QQ=="
+	txresp -body "REFS"
+	rxreq
+	expect req.method == "POST"
+	txresp -body "PACK2"
+} -start
+
+varnish v1 -vcl+backend {
+	import gitcache from "${vmod}";
+
+	sub vcl_init {
+		new git = gitcache.cache(scope = "t", debug = true, purge_token = "tok");
+	}
+	sub vcl_recv {
+		if (req.url ~ "^/_purge") { return (synth(git.purge())); }
+		if (git.recv()) { return (hash); }
+	}
+	sub vcl_hash             { if (git.hash()) { return (lookup); } }
+	sub vcl_backend_fetch    { git.backend_fetch(); }
+	sub vcl_backend_response { if (git.backend_response()) { return (deliver); } }
+	sub vcl_deliver          { if (git.deliver()) { return (restart); } }
+} -start
+
+client c1 {
+	txreq -url "/plain"
+	rxresp
+	expect resp.body == "plain"
+	expect resp.http.X-GC-Kind == <undef>
+
+	txreq -req POST -url "/o/r.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -hdr "Authorization: Basic QQ==" -body "0012command=fetch\n0001000ewant 1111\n0009done\n0000"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "PACK"
+	expect resp.http.X-GC-Kind == "fetch"
+	expect resp.http.X-GC-Hits == "0"
+	expect resp.http.X-GC-Repo == <undef>
+
+	txreq -req POST -url "/o/r.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -hdr "Authorization: Basic QQ==" -body "0012command=fetch\n0001000ewant 1111\n0009done\n0000"
+	rxresp
+	expect resp.body == "PACK"
+	expect resp.http.X-GC-Hits == "1"
+
+	txreq -req POST -url "/o/r.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -hdr "Authorization: Basic Qg==" -body "0012command=fetch\n0001000ewant 1111\n0009done\n0000"
+	rxresp
+	expect resp.body == "PACK"
+	expect resp.http.X-GC-Hits == "2"
+
+	txreq -req POST -url "/o/r.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -hdr "Authorization: Basic Qw==" -body "0012command=fetch\n0001000ewant 1111\n0009done\n0000"
+	rxresp
+	expect resp.status == 401
+	expect resp.body == "denied"
+
+	txreq -req POST -url "/o/r.git/git-receive-pack" -body "0000"
+	rxresp
+	expect resp.body == "pushed"
+	expect resp.http.X-GC-Kind == <undef>
+} -run
+
+client c2 {
+	txreq -req POST -url "/_purge?repo=O/R" -hdr "X-Purge-Token: tok"
+	rxresp
+	expect resp.status == 200
+
+	txreq -req POST -url "/o/r.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -hdr "Authorization: Basic QQ==" -body "0012command=fetch\n0001000ewant 1111\n0009done\n0000"
+	rxresp
+	expect resp.body == "PACK2"
+	expect resp.http.X-GC-Hits == "0"
+
+	txreq -req POST -url "/_purge?repo=o/r"
+	rxresp
+	expect resp.status == 403
+
+	txreq -req POST -url "/_purge?repo=o/r" -hdr "X-Purge-Token: nope"
+	rxresp
+	expect resp.status == 403
+
+	txreq -url "/_purge?repo=o/r" -hdr "X-Purge-Token: tok"
+	rxresp
+	expect resp.status == 405
+
+	txreq -req POST -url "/_purge?repo=a%20b" -hdr "X-Purge-Token: tok"
+	rxresp
+	expect resp.status == 400
+
+	txreq -req POST -url "/_purge" -hdr "X-Purge-Token: tok"
+	rxresp
+	expect resp.status == 400
+
+	txreq -req POST -url "/_purge?repo=../x" -hdr "X-Purge-Token: tok"
+	rxresp
+	expect resp.status == 400
+} -run
+
+client c3 {
+	txreq -url "/plain" -hdr "X-GC-Stage: go" -hdr "X-GC-Key: forged"
+	rxresp
+	expect resp.status == 200
+} -run
+
+# restarts that the module did not cause: forged state must not survive them, nor stale state outlive a URL change
+server s2 {
+	rxreq
+	expect req.url == "/o/r.git/HEAD"
+	txresp -body "SECRET"
+	rxreq
+	expect req.url == "/plain"
+	txresp -body "plain"
+	rxreq
+	expect req.url == "/o/r.git/info/refs?service=git-upload-pack"
+	txresp -body "REFS"
+	rxreq
+	expect req.method == "POST"
+	expect req.bodylen == 200
+	txresp -body "big"
+} -start
+
+varnish v2 -vcl+backend {
+	import gitcache from "${vmod}";
+
+	sub vcl_init {
+		new git = gitcache.cache(scope = "t", limit = 100B);
+	}
+	sub vcl_recv {
+		set req.backend_hint = s2;
+		if (req.restarts == 0 && req.http.X-Pre) { return (restart); }
+		if (req.restarts > 0 && req.http.X-Again) { set req.url = "/plain"; }
+		if (git.recv()) { return (hash); }
+	}
+	sub vcl_hash             { if (git.hash()) { return (lookup); } }
+	sub vcl_backend_fetch    { git.backend_fetch(); }
+	sub vcl_backend_response { if (git.backend_response()) { return (deliver); } }
+	sub vcl_deliver {
+		if (git.deliver()) { return (restart); }
+		if (req.http.X-Again && req.restarts == 0) { return (restart); }
+	}
+} -start
+
+client c4 -connect ${v2_sock} {
+	txreq -url "/o/r.git/HEAD" -hdr "Authorization: Basic QQ=="
+	rxresp
+	expect resp.body == "SECRET"
+
+	txreq -url "/plain" -hdr "X-Pre: 1" -hdr "X-GC-Stage: go" -hdr "X-GC-Orig-URL: /o/r.git/HEAD" -hdr "X-GC-Orig-Method: GET" -hdr "X-GC-Okind: dumb-refs" -hdr "X-GC-Final: t/o/r.git/HEAD#cred=db83e4ebfd70568f"
+	rxresp
+	expect resp.body == "plain"
+
+	txreq -url "/o/r.git/info/refs?service=git-upload-pack" -hdr "X-Again: 1"
+	rxresp
+	expect resp.body == "plain"
+
+	txreq -req POST -url "/o/r.git/git-upload-pack" -hdr "Content-Type: application/x-git-upload-pack-request" -bodylen 200
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "big"
+} -run

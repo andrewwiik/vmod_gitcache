@@ -1,0 +1,8 @@
+ARG ENTERPRISE_VERSION=6.0.18r5
+FROM docker.io/varnish/enterprise:${ENTERPRISE_VERSION}
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      "varnish-plus-dev=$(dpkg-query -W -f='${Version}' varnish-plus)" \
+      build-essential pkg-config python3 zlib1g-dev libssl-dev git git-lfs ca-certificates curl clang llvm libclang-rt-19-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /work

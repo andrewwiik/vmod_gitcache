@@ -1,0 +1,200 @@
+$Module gitcache 3 "Git smart-HTTP request classification and canonical cache keys"
+$ABI strict
+
+DESCRIPTION
+===========
+
+Classifies git smart-HTTP requests (as sent to github.com and compatible
+servers) and builds stable cache keys for the POST requests git uses for
+fetch and clone. Two clients asking for the same objects get the same key even
+if they differ in client telemetry (``agent=``, ``session-id=``) or in the
+order of set-like lines (``want``, ``ref-prefix``).
+
+Example::
+
+	import gitcache;
+
+	sub vcl_recv {
+		if (gitcache.kind() != "") {
+			if (gitcache.kind() == "receive-pack") { return (pipe); }
+			set req.http.X-Cache-Key = gitcache.cache_key();
+			if (req.http.X-Cache-Key == "") { return (pass); }
+		}
+	}
+
+	sub vcl_hash {
+		hash_data(req.http.X-Cache-Key);
+		return (lookup);
+	}
+
+$Function STRING kind()
+
+Restricted to the client side.
+
+Returns what the request is, derived from method, URL and, for upload-pack
+POSTs, the buffered body:
+
+* ``info-refs``: ``GET .../info/refs?service=git-upload-pack``
+* ``info-refs-push``: ``GET .../info/refs?service=git-receive-pack``
+* ``ls-refs``, ``object-info``, ``bundle-uri``: protocol v2 commands
+* ``fetch``: any other v2 command, normally ``command=fetch``
+* ``upload-pack``: protocol v0/v1 ``POST .../git-upload-pack``
+* ``probe``: the bare ``0000`` POST git sends before a large request
+* ``receive-pack``: ``POST .../git-receive-pack`` (push, never cache)
+* ``lfs-batch``: ``POST .../info/lfs/objects/batch``
+* ``lfs-object``: ``GET`` of an LFS object: ``.../info/lfs/objects/<sha256>``,
+  or any ``GET`` whose last path segment is a 64-hex SHA-256 (a transfer URL
+  chosen by the server, e.g. ``/repository/<repo>/<oid>``)
+* ``lfs-other``: any other LFS endpoint (locks, upload ``verify``, ...); never cache
+* ``dumb-refs``: dumb-protocol mutable files (``info/refs`` without
+  ``service``, ``HEAD``, ``objects/info/packs``, alternates)
+* ``dumb-object``: dumb-protocol immutable objects and packs
+* empty string: not a git request
+
+For a POST to upload-pack the body is buffered with ``std.cache_req_body()``
+semantics (limit 10MB) if it is not already.
+
+$Function STRING repo()
+
+Restricted to the client side.
+
+The lowercased ``owner/name`` of the repository, without leading slash or
+``.git``. Empty if the request is not a git request.
+
+$Function INT protocol()
+
+Restricted to the client side.
+
+The wire protocol version from the ``Git-Protocol`` header: 0, 1 or 2.
+
+$Function STRING body_hash(BYTES limit = 10485760)
+
+Restricted to the client side.
+
+Hex SHA-256 of the canonical form of the upload-pack request body. Buffers
+the body if necessary. Returns an empty string when the body is larger than
+``limit``, is not valid pkt-line framing or on failure; the request must then
+not be cached by body.
+
+$Function STRING credential()
+
+Restricted to the client side.
+
+A short, non-reversible fingerprint (truncated SHA-256) of the
+``Authorization`` header, or an empty string if the request carries none.
+Never log the header itself; this value is safe to use in keys and logs.
+
+$Function STRING cache_key(BYTES limit = 10485760, STRING scope = "", BOOL share_credentials = 0, BOOL lfs_batch = 0)
+
+Restricted to the client side.
+
+A complete cache key such as
+``<scope>/torvalds/linux.git/git-upload-pack/v2/<sha256>``. Empty for
+anything that must not be cached: push traffic, non-git requests, oversize or
+malformed bodies.
+
+``scope`` is prepended verbatim. Use it to separate upstreams that share
+``owner/name`` space, for example the Host of each GitHub Enterprise Server
+instance fronted by one cache.
+
+``lfs_batch`` enables caching of Git LFS batch responses, download operations
+only. Those responses contain time-limited transfer URLs, so the TTL must be
+shorter than their expiry; upload batches are never cached.
+
+Requests carrying an ``Authorization`` header get a key that includes
+``credential()``, so a private repository's data is never served to a client
+that did not present the same credentials. Set ``share_credentials`` only
+when access is verified separately (for example by a preflight to
+``info/refs``) before a cached object is delivered.
+
+$Object cache(STRING scope = "", DURATION refs_ttl = 5, DURATION pack_ttl = 604800,
+    DURATION lfs_batch_ttl = 10, BOOL preflight = 1, BOOL lfs_batch = 0,
+    BOOL debug = 0, STRING purge_token = "", BYTES limit = 10485760,
+    DURATION transfer_timeout = 3600)
+
+A complete caching policy for git over HTTP. With it, the VCL is one line per
+subroutine::
+
+	import gitcache;
+
+	sub vcl_init {
+		new git = gitcache.cache(scope = "ghes1");
+	}
+	sub vcl_recv             { if (git.recv()) { return (hash); } }
+	sub vcl_hash             { if (git.hash()) { return (lookup); } }
+	sub vcl_backend_fetch    { git.backend_fetch(); }
+	sub vcl_backend_response { if (git.backend_response()) { return (deliver); } }
+	sub vcl_deliver          { if (git.deliver()) { return (restart); } }
+
+Requests that are not cacheable git traffic (including every push) fall
+through to the rest of the VCL untouched.
+
+``scope`` separates upstreams, see ``cache_key()``. ``refs_ttl`` applies to
+refs advertisements and listings, which change as people push; they are kept
+for a short time with no grace period, so a stale tip is never served while
+revalidating. ``pack_ttl`` applies to packs and content-addressed objects, which are fixed
+by the request and never change, so it can be long (one week by default);
+because history can be rewritten or deleted at the origin, purge a repository
+after such a change.
+``lfs_batch_ttl`` applies to LFS batch responses when ``lfs_batch`` is true.
+``transfer_timeout`` is how long one pack or LFS object transfer may take,
+both waiting for the origin's first byte and sending to the client; Varnish's
+defaults (60 s and 600 s) cut off a cold clone of a large repository.
+
+``preflight`` shares packs between users and re-checks access first: before a
+cached pack is delivered, the same user's credential-scoped ``info/refs`` is
+fetched (or served from cache for ``refs_ttl``) and the pack is only delivered
+if the origin accepted it. A refusal from the origin is passed to the client
+unchanged. With ``preflight`` off, packs are cached per credential instead.
+
+``debug`` adds ``X-GC-Kind`` and ``X-GC-Hits`` response headers.
+
+``purge_token`` enables ``.purge()``; leave it empty to disable purging.
+
+``limit`` bounds the size of request bodies that are buffered and hashed.
+
+$Method BOOL .recv()
+$Restrict vcl_recv
+
+Classify the request and decide whether it is cacheable git traffic. Returns
+true if so, and the VCL should ``return (hash)``. Removes the module's
+internal headers from client requests, and for packs sets up the access
+check described above.
+
+$Method BOOL .hash()
+$Restrict vcl_hash
+
+Adds the cache key to the hash. Returns true if it did, and the VCL should
+``return (lookup)``; false for requests that are not git traffic, which keep
+the built-in hash.
+
+$Method VOID .backend_fetch()
+$Restrict vcl_backend_fetch
+
+Adjusts the backend request: restores POST for POST-based requests, and turns
+the access check into a bodyless GET.
+
+$Method BOOL .backend_response()
+$Restrict vcl_backend_response
+
+Applies the TTL and grace policy, refuses to cache anything but a 200, and
+tags the object with its repository so ``.purge()`` can find it. Returns
+true for git traffic, and the VCL should ``return (deliver)``; this skips the
+built-in handling, which would honour the origin's ``Cache-Control: no-cache``
+(git servers send it on these responses).
+
+$Method BOOL .deliver()
+$Restrict vcl_deliver
+
+Returns true if the access check succeeded and the VCL should
+``return (restart)`` to serve the pack; false otherwise, including when the
+origin refused the check, in which case its answer is delivered unchanged.
+
+$Method INT .purge()
+$Restrict vcl_recv
+
+Handles ``POST <path>?repo=owner/name`` with an ``X-Purge-Token`` header:
+removes every cached object of that repository, for use from a push webhook.
+Returns the HTTP status for the VCL to answer with: 200, 400 (bad repository
+name), 403 (missing or wrong token, or purging disabled), 405 (not a POST) or
+500. Use as ``return (synth(git.purge()));`` on the path of your choice.

@@ -1,0 +1,12 @@
+0012command=fetch
+0015agent=git/2.43.0
+0013session-id=abc
+0017object-format=sha1
+0001000ethin-pack
+000eofs-delta
+0010no-progress
+0032want aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+0032want bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+0032have cccccccccccccccccccccccccccccccccccccccc
+0009done
+0000

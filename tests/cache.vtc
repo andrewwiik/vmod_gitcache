@@ -1,0 +1,63 @@
+varnishtest "gitcache: equivalent upload-pack POSTs share one cache object"
+
+server s1 {
+	rxreq
+	expect req.method == "POST"
+	txresp -body "PACK-1111-2222"
+	rxreq
+	txresp -body "PACK-9999"
+	rxreq
+	txresp -body "PUSH"
+	rxreq
+	txresp -body "BAD"
+} -start
+
+varnish v1 -vcl+backend {
+	import gitcache from "${vmod}";
+	sub vcl_recv {
+		if (gitcache.kind() == "") { return (pass); }
+		set req.http.X-Key = gitcache.cache_key();
+		if (req.http.X-Key == "") { return (pass); }
+		return (hash);
+	}
+	sub vcl_hash {
+		hash_data(req.http.X-Key);
+		return (lookup);
+	}
+	sub vcl_backend_fetch {
+		set bereq.method = "POST";
+	}
+	sub vcl_backend_response {
+		set beresp.ttl = 60s;
+	}
+	sub vcl_deliver {
+		set resp.http.X-Key = req.http.X-Key;
+		set resp.http.X-Hits = obj.hits;
+	}
+} -start
+
+client c1 {
+	txreq -req POST -url "/Owner/Repo.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -body "0012command=fetch\n0015agent=git/2.43.0\n0013session-id=aaa\n0017object-format=sha1\n0001000ewant 1111\n000ewant 2222\n0009done\n0000"
+	rxresp
+	expect resp.body == "PACK-1111-2222"
+	expect resp.http.X-Hits == "0"
+	expect resp.http.X-Key ~ "^/owner/repo[.]git/git-upload-pack/v2/[0-9a-f]+$"
+
+	txreq -req POST -url "/owner/repo/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -body "0012command=fetch\n0016session-id=bbbbbb\n001bagent=git/2.50.1-Apple\n0017object-format=sha1\n0001000ewant 2222\n000ewant 1111\n0009done\n0000"
+	rxresp
+	expect resp.body == "PACK-1111-2222"
+	expect resp.http.X-Hits == "1"
+
+	txreq -req POST -url "/owner/repo.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -body "0012command=fetch\n0001000ewant 9999\n0009done\n0000"
+	rxresp
+	expect resp.body == "PACK-9999"
+	expect resp.http.X-Hits == "0"
+
+	txreq -req POST -url "/o/r.git/git-receive-pack" -body "0000"
+	rxresp
+	expect resp.http.X-Key == ""
+
+	txreq -req POST -url "/o/r.git/git-upload-pack" -hdr "Git-Protocol: version=2" -hdr "Content-Type: application/x-git-upload-pack-request" -body "zzzz"
+	rxresp
+	expect resp.http.X-Key == ""
+} -run

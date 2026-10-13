@@ -1,0 +1,6 @@
+{
+	global:
+		Vmod_gitcache_Data;
+	local:
+		*;
+};

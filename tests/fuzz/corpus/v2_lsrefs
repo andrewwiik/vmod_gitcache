@@ -1,0 +1,7 @@
+0014command=ls-refs
+0013agent=git/2.50
+00010009peel
+000csymrefs
+0014ref-prefix HEAD
+001bref-prefix refs/heads/
+0000
